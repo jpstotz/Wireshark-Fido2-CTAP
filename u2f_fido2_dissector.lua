@@ -91,6 +91,10 @@ CTAP_KEEPALIVE_STATUS_CODES = {
 }
 
 function payload_dissector(pinfo, subtree, state)
+    if state.payload_buffer:len() < state.total_len then
+        subtree:add(string.format("ERROR: payload buffer incomplete: %d of %d", state.payload_buffer:len(), state.total_len))
+        return
+    end
     local t = ByteArray.tvb(state.payload_buffer:subset(0, state.total_len), "payload")
     local isIN = 0
     local usb_dir = direction_fe()
@@ -167,20 +171,19 @@ cached_info = {}
 total_len = 0
 ctaphid_cmd = 0
 payload_buffer = nil
+channels = {}
 
 -- create a function to dissect it
 function ctap_proto.dissector(buffer, pinfo, tree)
-    --  if buffer:len() == 0 then
-    --      return
-    --  end
     pinfo.cols.protocol = "CTAPHID"
     local subtree = tree:add(ctap_proto, buffer(), "CTAPHID")
     local data = nil
     local first_packet
     -- subtree:add(buffer,"length=" .. string.format('0x%08x',buffer:len()) .. " " .. direction_fe().value)
-    local cid = buffer(0, 4):uint()
-    subtree:add(buffer(0, 4), string.format("CID: 0x%08x", cid))
+    local channel_id = buffer(0, 4):uint()
+    subtree:add(buffer(0, 4), string.format("CID: 0x%08x", channel_id))
     local cmd = buffer(4, 1):uint()
+    local already_processed = false
     if bit.band(cmd, 0x80) == 0x80 then
         first_packet = true
         ctaphid_cmd = bit.band(cmd, 0x7f)
@@ -188,48 +191,73 @@ function ctap_proto.dissector(buffer, pinfo, tree)
         subtree:add(buffer(4, 1), "CMD: " .. cmd_str)
 
         total_len = buffer(5, 2):uint()
-        subtree:add(buffer(5, 2), string.format("Length: 0x%04x", total_len))
+        subtree:add(buffer(5, 2), string.format("Length: 0x%04x (%d)", total_len, total_len))
 
         payload_buffer = ByteArray.new()
         data = buffer(7)
+
+        channel_info = {}
+        channel_info.total_len = total_len
+        channel_info.ctaphid_cmd = ctaphid_cmd
+        channel_info.payload_buffer = payload_buffer
+        channel_info.first_msg_id = pinfo.number
+        
+        channels[channel_id] = channel_info
     else
+        channel_info = channels[channel_id]
+        if channel_info == nil then
+            subtree:add("Channel_info not found")
+        else
+            total_len = channel_info.total_len
+            ctaphid_cmd = channel_info.ctaphid_cmd
+            payload_buffer = channel_info.payload_buffer
+        end
         first_packet = false
         subtree:add(buffer(4, 1), string.format("SEQ: 0x%02x", cmd))
+        subtree:add("Data length: " .. buffer:len() - 5)
         data = buffer(5)
     end
-    payload_buffer:append(data:bytes())
-    if payload_buffer:len() < total_len then
-        pinfo.cols.info =
-            string.format("%s (0x%02x) - continuation packet", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
+    if total_len == 0 then
+        pinfo.cols.info = string.format("%s (0x%02x)", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
         pinfo.cols.info:fence()
-        subtree:add(
-            string.format(
-                "Payload is transmitted in multiple packets, for decoded payload see last message in sequence. This message included we have %d of %d bytes",
-                payload_buffer:len(),
-                total_len
-            )
-        )
-    else
-        if first_packet then
-            pinfo.cols.info = string.format("%s (0x%02x)", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
-        else
-            pinfo.cols.info =
-                string.format("%s (0x%02x) - final packet", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
-        end
-        pinfo.cols.info:fence()
+        payload_buffer = ByteArray.new()
+        return
     end
     local state = cached_info[pinfo.number]
-    if state ~= nil and state.ctaphid_cmd ~= nil then
-        if payload_buffer:len() >= total_len then
-            payload_dissector(pinfo, subtree, state)
+    if state == nil then
+        payload_buffer:append(data:bytes())
+        if payload_buffer:len() < total_len then
+            pinfo.cols.info =
+                string.format("%s (0x%02x) - continuation packet", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
+            pinfo.cols.info:fence()
+            subtree:add(
+                string.format(
+                    "Payload is transmitted in multiple packets, for decoded payload see last message in sequence. This message included we have %d of %d bytes",
+                    payload_buffer:len(),
+                    total_len
+                )
+            )
+        else
+            if first_packet then
+                pinfo.cols.info = string.format("%s (0x%02x)", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
+            else
+                pinfo.cols.info =
+                    string.format("%s (0x%02x) - final packet", CTAPHID_COMMAND_CODE[ctaphid_cmd], ctaphid_cmd)
+            end
+            pinfo.cols.info:fence()
         end
-    else
         state = {}
         state.ctaphid_cmd = ctaphid_cmd
         state.payload_buffer = payload_buffer
         state.total_len = total_len
         cached_info[pinfo.number] = state
         payload_dissector(pinfo, subtree, state)
+        payload_buffer = nil
+    else
+        payload_buffer = state.payload_buffer
+        if payload_buffer:len() >= total_len then
+            payload_dissector(pinfo, subtree, state)
+        end
     end
 end
 usb_table = DissectorTable.get("usb.product")
